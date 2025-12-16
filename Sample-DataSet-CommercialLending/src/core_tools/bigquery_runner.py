@@ -169,3 +169,45 @@ class BigQueryRunner:
         except Exception as e:
             logger.warning(f"Failed to get row count for {table_id}", data={"error": str(e)})
             return 0
+
+    def create_dataset(self, dataset_id: str, location: str = "US") -> str:
+        """
+        Create a new BigQuery dataset.
+        
+        Args:
+            dataset_id: The ID of the dataset to create.
+            location: The location for the dataset (default: US).
+        
+        Returns:
+            The full dataset ID.
+        """
+        logger.info(f"Creating dataset: {dataset_id}", data={"location": location})
+        
+        try:
+            dataset_ref = bigquery.Dataset(f"{self.project_id}.{dataset_id}")
+            dataset_ref.location = location
+            
+            dataset = self.client.create_dataset(dataset_ref, exists_ok=True)
+            
+            logger.success(f"Dataset created: {dataset_id}", data={
+                "full_id": f"{self.project_id}.{dataset_id}",
+                "location": location
+            })
+            
+            return f"{self.project_id}.{dataset_id}"
+            
+        except Exception as e:
+            logger.error(f"Failed to create dataset: {dataset_id}", error=e)
+            raise
+
+    def switch_dataset(self, dataset_id: str):
+        """
+        Switch to a different dataset.
+        
+        Args:
+            dataset_id: The ID of the dataset to switch to.
+        """
+        logger.info(f"Switching dataset: {self.dataset_id} -> {dataset_id}")
+        self.dataset_id = dataset_id
+        self.dataset_ref = self.client.dataset(self.dataset_id)
+        logger.success(f"Now using dataset: {dataset_id}")

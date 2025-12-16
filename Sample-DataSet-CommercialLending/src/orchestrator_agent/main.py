@@ -52,28 +52,44 @@ def run_orchestration(
     })
 
     gcp_project_id = os.getenv("GCP_PROJECT_ID")
-    bigquery_dataset = os.getenv("BIGQUERY_DATASET")
+    bigquery_dataset_base = os.getenv("BIGQUERY_DATASET")
     gcs_bucket = os.getenv("GCS_BUCKET")
     enable_hitl = os.getenv("ENABLE_HITL", "false").lower() == "true"
+    create_dataset_per_run = os.getenv("CREATE_DATASET_PER_RUN", "false").lower() == "true"
 
-    if not all([gcp_project_id, bigquery_dataset, gcs_bucket]):
+    if not all([gcp_project_id, bigquery_dataset_base, gcs_bucket]):
         logger.critical("Missing required environment variables", data={
             "GCP_PROJECT_ID": bool(gcp_project_id),
-            "BIGQUERY_DATASET": bool(bigquery_dataset),
+            "BIGQUERY_DATASET": bool(bigquery_dataset_base),
             "GCS_BUCKET": bool(gcs_bucket)
         })
         return
+
+    # Determine the dataset name
+    if create_dataset_per_run:
+        # Create a unique dataset name with run_id
+        bigquery_dataset = f"{bigquery_dataset_base}_{run_id.replace('-', '_')}"
+        logger.info(f"Creating new dataset for this run: {bigquery_dataset}")
+    else:
+        bigquery_dataset = bigquery_dataset_base
 
     logger.info("Environment configuration loaded", data={
         "project": gcp_project_id,
         "dataset": bigquery_dataset,
         "bucket": gcs_bucket,
-        "hitl_enabled": enable_hitl
+        "hitl_enabled": enable_hitl,
+        "create_dataset_per_run": create_dataset_per_run
     })
 
     try:
         bq_runner = BigQueryRunner(project_id=gcp_project_id, dataset_id=bigquery_dataset)
         gcs_io = GCS_IO(project_id=gcp_project_id, bucket_name=gcs_bucket)
+        
+        # Create the dataset if using per-run datasets
+        if create_dataset_per_run:
+            bq_runner.create_dataset(bigquery_dataset)
+            logger.success(f"Created new dataset: {bigquery_dataset}")
+        
         logger.success("GCP clients initialized successfully")
     except Exception as e:
         logger.critical("Failed to initialize GCP clients", error=e)
@@ -119,7 +135,7 @@ def run_orchestration(
         try:
             profile_results = run_profiler(run_id)
             source_tables_info = profile_results.get("tables", [])
-            
+
             step_duration = int((time.time() - step_start) * 1000)
             logger.step_complete("PROFILING", duration_ms=step_duration, data={
                 "tables_profiled": len(source_tables_info),
@@ -155,7 +171,7 @@ def run_orchestration(
 
         source_dataset_for_transform = bigquery_dataset
         staged_tables = 0
-        
+
         try:
             for table_info in source_tables_info:
                 table_name = table_info["table_name"]
@@ -163,7 +179,7 @@ def run_orchestration(
                 gcs_blob_name = f"{run_id}/{table_name}.csv"
 
                 logger.info(f"Uploading table: {table_name}", data={"source": local_csv_path, "destination": gcs_blob_name})
-                
+
                 # Upload to GCS
                 gcs_uri = gcs_io.upload_file(local_csv_path, gcs_blob_name)
                 logger.debug(f"Upload complete: {table_name}", data={"gcs_uri": gcs_uri})
@@ -171,11 +187,11 @@ def run_orchestration(
                 # Create External Table in BQ
                 external_table_id = f"{table_name}_ext_{run_id}"
                 table_info["external_table_id"] = external_table_id
-                
+
                 logger.info(f"Creating external table: {external_table_id}")
                 bq_runner.create_external_table(external_table_id, gcs_uri, table_info["columns"])
                 logger.debug(f"External table created: {external_table_id}")
-                
+
                 staged_tables += 1
 
             step_duration = int((time.time() - step_start) * 1000)
@@ -209,7 +225,7 @@ def run_orchestration(
 
         try:
             mapping_candidates = run_mapper(run_id, profile_results)
-            
+
             step_duration = int((time.time() - step_start) * 1000)
             logger.step_complete("MAPPING", duration_ms=step_duration, data={
                 "candidates_generated": len(mapping_candidates)
@@ -224,7 +240,10 @@ def run_orchestration(
             "status": "completed",
             "progress": 45,
             "message": f"Generated {len(mapping_candidates)} mapping candidates",
-            "data": {"mapping_count": len(mapping_candidates)}
+            "data": {
+                "mapping_count": len(mapping_candidates),
+                "mappings": mapping_candidates  # Include full mappings for frontend dropdown
+            }
         })
         update_state("mapper", 45, "completed", {"mapping_count": len(mapping_candidates)})
 
@@ -233,26 +252,27 @@ def run_orchestration(
         # ====================================================================
         if enable_hitl:
             step_start = time.time()
-            logger.step_start("HITL", "Waiting for human approval of mappings")
+            logger.step_start("HITL", "Processing mappings with confidence-based approval")
             broadcast({
                 "type": "workflow_update",
                 "step": "hitl",
-                "status": "waiting",
+                "status": "started",
                 "progress": 50,
-                "message": "Waiting for human approval of mappings...",
-                "data": {"mappings": mapping_candidates}
+                "message": "Processing mappings - checking confidence scores..."
             })
-            update_state("hitl", 50, "waiting")
-
-            # Store mappings in Firestore for web-based approval
-            if hitl_store:
-                logger.info("Storing mappings in Firestore for web-based approval")
-                hitl_store.store_hitl_mappings(run_id, mapping_candidates)
+            update_state("hitl", 50, "started")
 
             try:
-                # Run HITL agent (will use Firestore or fall back to CLI)
-                approved_mappings = run_hitl(run_id, mapping_candidates, hitl_store)
-                
+                # Run HITL agent with broadcast function for WebSocket updates
+                # The HITL agent will auto-approve high-confidence mappings
+                # and request human approval for low-confidence ones
+                approved_mappings = run_hitl(
+                    run_id,
+                    mapping_candidates,
+                    hitl_store,
+                    websocket_broadcast=broadcast
+                )
+
                 step_duration = int((time.time() - step_start) * 1000)
                 logger.step_complete("HITL", duration_ms=step_duration, data={
                     "approved": len(approved_mappings),
@@ -303,14 +323,17 @@ def run_orchestration(
 
         target_schema_dir = "Target-Schema"
         table_count = 0
-        
+
         try:
             for filename in os.listdir(target_schema_dir):
                 if filename.endswith(".sql"):
                     with open(os.path.join(target_schema_dir, filename), 'r') as f:
                         sql_content = f.read()
+                        # Handle both `analytics.` and `project.dataset.` placeholders
                         qualified_sql = sql_content.replace(
                             "`analytics.", f"`{gcp_project_id}.{bigquery_dataset}."
+                        ).replace(
+                            "`project.dataset.", f"`{gcp_project_id}.{bigquery_dataset}."
                         )
                         logger.info(f"Creating table from: {filename}")
                         bq_runner.run_query(qualified_sql)
@@ -351,9 +374,10 @@ def run_orchestration(
                 run_id,
                 approved_mappings,
                 source_tables_info=source_tables_info,
-                source_dataset=source_dataset_for_transform
+                source_dataset=source_dataset_for_transform,
+                target_dataset=bigquery_dataset
             )
-            
+
             step_duration = int((time.time() - step_start) * 1000)
             logger.step_complete("TRANSFORM", duration_ms=step_duration, data={"queries_generated": len(transform_sql)})
         except Exception as e:
@@ -365,7 +389,10 @@ def run_orchestration(
             "step": "transform",
             "status": "completed",
             "progress": 75,
-            "message": f"Generated {len(transform_sql)} transformation queries"
+            "message": f"Generated {len(transform_sql)} transformation queries",
+            "data": {
+                "transformations": transform_sql  # Include full transformations for frontend dropdown
+            }
         })
         update_state("transform", 75, "completed")
 
@@ -388,10 +415,10 @@ def run_orchestration(
             for idx, sql in enumerate(transform_sql):
                 logger.info(f"Executing transformation {idx + 1}/{len(transform_sql)}")
                 logger.debug(f"SQL Preview: {sql[:200]}...")
-                
+
                 bq_runner.run_query(sql)
                 executed_count += 1
-                
+
                 progress = 80 + int((idx + 1) / len(transform_sql) * 10)
                 broadcast({
                     "type": "workflow_update",
@@ -433,7 +460,7 @@ def run_orchestration(
 
         try:
             validation_results = run_validator(run_id)
-            
+
             step_duration = int((time.time() - step_start) * 1000)
             logger.step_complete("VALIDATION", duration_ms=step_duration, data={
                 "status": validation_results.get("status", "unknown"),
@@ -482,7 +509,7 @@ def run_orchestration(
 
         try:
             run_feedback(run_id, validation_results)
-            
+
             step_duration = int((time.time() - step_start) * 1000)
             logger.step_complete("FEEDBACK", duration_ms=step_duration)
         except Exception as e:
@@ -514,13 +541,20 @@ def run_orchestration(
             "validation_status": validation_results.get("status", "unknown")
         })
         
+        # Prepare complete data including mappings and transformations
+        complete_data = {
+            **validation_results,
+            "mappings": approved_mappings,  # Include approved mappings
+            "transformations": transform_sql if 'transform_sql' in locals() else []  # Include transformations if available
+        }
+        
         broadcast({
             "type": "workflow_complete",
             "step": "completed",
             "status": "success",
             "progress": 100,
             "message": "ETL workflow completed successfully!",
-            "data": validation_results
+            "data": complete_data
         })
 
         if state_store:
@@ -597,7 +631,7 @@ def run_orchestration_from_gcs(
 
     Args:
         run_id: Unique workflow run identifier
-        gcs_source_folder: GCS folder containing Source-Schema-DataSets (CSV + schema.json)
+        gcs_source_folder: GCS folder containing source data (CSV + schema.json or source_schema.json)
         gcs_target_folder: GCS folder containing Target-Schema SQL files (optional, uses local if None)
         websocket_manager: WebSocket manager for real-time updates (optional)
         state_store: StateStore for workflow state persistence (optional)
@@ -617,28 +651,44 @@ def run_orchestration_from_gcs(
     })
 
     gcp_project_id = os.getenv("GCP_PROJECT_ID")
-    bigquery_dataset = os.getenv("BIGQUERY_DATASET")
+    bigquery_dataset_base = os.getenv("BIGQUERY_DATASET")
     gcs_bucket = os.getenv("GCS_BUCKET")
     enable_hitl = os.getenv("ENABLE_HITL", "false").lower() == "true"
+    create_dataset_per_run = os.getenv("CREATE_DATASET_PER_RUN", "false").lower() == "true"
 
-    if not all([gcp_project_id, bigquery_dataset, gcs_bucket]):
+    if not all([gcp_project_id, bigquery_dataset_base, gcs_bucket]):
         logger.critical("Missing required environment variables", data={
             "GCP_PROJECT_ID": bool(gcp_project_id),
-            "BIGQUERY_DATASET": bool(bigquery_dataset),
+            "BIGQUERY_DATASET": bool(bigquery_dataset_base),
             "GCS_BUCKET": bool(gcs_bucket)
         })
         return
+
+    # Determine the dataset name
+    if create_dataset_per_run:
+        # Create a unique dataset name with run_id
+        bigquery_dataset = f"{bigquery_dataset_base}_{run_id.replace('-', '_')}"
+        logger.info(f"Creating new dataset for this run: {bigquery_dataset}")
+    else:
+        bigquery_dataset = bigquery_dataset_base
 
     logger.info("Environment configuration loaded", data={
         "project": gcp_project_id,
         "dataset": bigquery_dataset,
         "bucket": gcs_bucket,
-        "hitl_enabled": enable_hitl
+        "hitl_enabled": enable_hitl,
+        "create_dataset_per_run": create_dataset_per_run
     })
 
     try:
         bq_runner = BigQueryRunner(project_id=gcp_project_id, dataset_id=bigquery_dataset)
         gcs_io = GCS_IO(project_id=gcp_project_id, bucket_name=gcs_bucket)
+        
+        # Create the dataset if using per-run datasets
+        if create_dataset_per_run:
+            bq_runner.create_dataset(bigquery_dataset)
+            logger.success(f"Created new dataset: {bigquery_dataset}")
+        
         logger.success("GCP clients initialized successfully")
     except Exception as e:
         logger.critical("Failed to initialize GCP clients", error=e)
@@ -686,26 +736,36 @@ def run_orchestration_from_gcs(
             # Create temp directory for downloaded files
             temp_dir = tempfile.mkdtemp(prefix=f"aimagna_{run_id}_")
             logger.info(f"Created temp directory: {temp_dir}")
-            
+
+            # Extract folder name from path (last part of the path)
+            source_folder_name = gcs_source_folder.rstrip('/').split('/')[-1]
+
             # Download source files
-            source_local_dir = os.path.join(temp_dir, "Source-Schema-DataSets")
+            source_local_dir = os.path.join(temp_dir, source_folder_name)
             os.makedirs(source_local_dir, exist_ok=True)
-            
+
             logger.info(f"Downloading source files from: gs://{gcs_bucket}/{gcs_source_folder}")
             source_files = gcs_io.download_folder(gcs_source_folder, source_local_dir)
-            logger.success(f"Downloaded {len(source_files)} source files")
-            
+            logger.success(f"Downloaded {len(source_files)} source files to {source_folder_name}/")
+
             # Download target schema if provided
-            target_local_dir = os.path.join(temp_dir, "Target-Schema")
             if gcs_target_folder:
+                target_folder_name = gcs_target_folder.rstrip('/').split('/')[-1]
+                target_local_dir = os.path.join(temp_dir, target_folder_name)
                 os.makedirs(target_local_dir, exist_ok=True)
                 logger.info(f"Downloading target schema from: gs://{gcs_bucket}/{gcs_target_folder}")
                 target_files = gcs_io.download_folder(gcs_target_folder, target_local_dir)
-                logger.success(f"Downloaded {len(target_files)} target schema files")
+                logger.success(f"Downloaded {len(target_files)} target schema files to {target_folder_name}/")
             else:
-                # Use local Target-Schema directory
-                target_local_dir = "Target-Schema"
-                logger.info("Using local Target-Schema directory")
+                # Use local Target-Schema directory (try both naming conventions)
+                for target_name in ["Target-Schema", "TargetSchema"]:
+                    if os.path.exists(target_name):
+                        target_local_dir = target_name
+                        logger.info(f"Using local {target_name} directory")
+                        break
+                else:
+                    target_local_dir = "Target-Schema"  # Default
+                    logger.info("Using local Target-Schema directory (default)")
             
             step_duration = int((time.time() - step_start) * 1000)
             logger.step_complete("DOWNLOAD", duration_ms=step_duration, data={
@@ -844,7 +904,10 @@ def run_orchestration_from_gcs(
             "status": "completed",
             "progress": 45,
             "message": f"Generated {len(mapping_candidates)} mapping candidates",
-            "data": {"mapping_count": len(mapping_candidates)}
+            "data": {
+                "mapping_count": len(mapping_candidates),
+                "mappings": mapping_candidates  # Include full mappings for frontend dropdown
+            }
         })
         update_state("mapper", 45, "completed", {"mapping_count": len(mapping_candidates)})
 
@@ -853,24 +916,26 @@ def run_orchestration_from_gcs(
         # ====================================================================
         if enable_hitl:
             step_start = time.time()
-            logger.step_start("HITL", "Waiting for human approval of mappings")
+            logger.step_start("HITL", "Processing mappings with confidence-based approval")
             broadcast({
                 "type": "workflow_update",
                 "step": "hitl",
-                "status": "waiting",
+                "status": "started",
                 "progress": 50,
-                "message": "Waiting for human approval of mappings...",
-                "data": {"mappings": mapping_candidates}
+                "message": "Processing mappings - checking confidence scores..."
             })
-            update_state("hitl", 50, "waiting")
-
-            # Store mappings in Firestore for web-based approval
-            if hitl_store:
-                logger.info("Storing mappings in Firestore for web-based approval")
-                hitl_store.store_hitl_mappings(run_id, mapping_candidates)
+            update_state("hitl", 50, "started")
 
             try:
-                approved_mappings = run_hitl(run_id, mapping_candidates, hitl_store)
+                # Run HITL agent with broadcast function for WebSocket updates
+                # The HITL agent will auto-approve high-confidence mappings
+                # and request human approval for low-confidence ones
+                approved_mappings = run_hitl(
+                    run_id, 
+                    mapping_candidates, 
+                    hitl_store,
+                    websocket_broadcast=broadcast
+                )
                 
                 step_duration = int((time.time() - step_start) * 1000)
                 logger.step_complete("HITL", duration_ms=step_duration, data={
@@ -927,8 +992,11 @@ def run_orchestration_from_gcs(
                 if filename.endswith(".sql"):
                     with open(os.path.join(target_local_dir, filename), 'r') as f:
                         sql_content = f.read()
+                        # Handle both `analytics.` and `project.dataset.` placeholders
                         qualified_sql = sql_content.replace(
                             "`analytics.", f"`{gcp_project_id}.{bigquery_dataset}."
+                        ).replace(
+                            "`project.dataset.", f"`{gcp_project_id}.{bigquery_dataset}."
                         )
                         logger.info(f"Creating table from: {filename}")
                         bq_runner.run_query(qualified_sql)
@@ -970,7 +1038,8 @@ def run_orchestration_from_gcs(
                 approved_mappings,
                 source_tables_info=source_tables_info,
                 source_dataset=source_dataset_for_transform,
-                source_schema_dir=source_local_dir
+                source_schema_dir=source_local_dir,
+                target_dataset=bigquery_dataset
             )
             
             step_duration = int((time.time() - step_start) * 1000)
@@ -984,7 +1053,10 @@ def run_orchestration_from_gcs(
             "step": "transform",
             "status": "completed",
             "progress": 75,
-            "message": f"Generated {len(transform_sql)} transformation queries"
+            "message": f"Generated {len(transform_sql)} transformation queries",
+            "data": {
+                "transformations": transform_sql  # Include full transformations for frontend dropdown
+            }
         })
         update_state("transform", 75, "completed")
 
@@ -1132,13 +1204,20 @@ def run_orchestration_from_gcs(
             "validation_status": validation_results.get("status", "unknown")
         })
         
+        # Prepare complete data including mappings and transformations
+        complete_data = {
+            **validation_results,
+            "mappings": approved_mappings,  # Include approved mappings
+            "transformations": transform_sql if 'transform_sql' in locals() else []  # Include transformations if available
+        }
+        
         broadcast({
             "type": "workflow_complete",
             "step": "completed",
             "status": "success",
             "progress": 100,
             "message": "ETL workflow completed successfully!",
-            "data": validation_results
+            "data": complete_data
         })
 
         if state_store:

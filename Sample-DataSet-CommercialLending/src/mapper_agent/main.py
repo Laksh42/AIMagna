@@ -19,12 +19,21 @@ logger = AgentLogger("MapperAgent")
 def parse_sql_create_table(sql_content: str):
     """
     Parses a SQL CREATE TABLE statement to extract table name and columns.
+    Supports both `analytics.table` and `project.dataset.table` formats.
     """
+    # Try analytics.* format (CommercialLending)
     table_name_match = re.search(r"CREATE TABLE IF NOT EXISTS `analytics\.(.*?)`", sql_content)
     if not table_name_match:
         table_name_match = re.search(r"CREATE TABLE `analytics\.(.*?)`", sql_content)
-        if not table_name_match:
-            return None, None
+
+    # Try project.dataset.* format (WorldBankData)
+    if not table_name_match:
+        table_name_match = re.search(r"CREATE TABLE IF NOT EXISTS `project\.dataset\.(.*?)`", sql_content)
+    if not table_name_match:
+        table_name_match = re.search(r"CREATE TABLE `project\.dataset\.(.*?)`", sql_content)
+
+    if not table_name_match:
+        return None, None
 
     table_name = table_name_match.group(1)
     
@@ -116,27 +125,45 @@ def run_mapper(run_id: str, profile_results: dict, target_schema_dir: str = None
     logger.subheader("Preparing Column Embeddings")
     source_column_docs = []
     source_column_info = []
-    
+    source_column_metadata = {}  # Map column_info to full metadata
+
     for table in source_schema:
         table_context = f"Table {table['table_name']} with columns: {', '.join([c['name'] for c in table['columns']])}."
         for column in table["columns"]:
             doc = f"{table_context} Column: {column['name']}. Description: {column.get('description', '')}"
             source_column_docs.append(doc)
-            source_column_info.append(f"{table['table_name']}.{column['name']}")
+            column_key = f"{table['table_name']}.{column['name']}"
+            source_column_info.append(column_key)
+            # Store full metadata including description
+            source_column_metadata[column_key] = {
+                "table": table['table_name'],
+                "column": column['name'],
+                "description": column.get('description', ''),
+                "type": column.get('type', '')
+            }
 
     logger.info(f"Source columns prepared", data={"count": len(source_column_docs)})
 
     # Prepare target column documents for embedding
     target_column_docs = []
     target_column_info = []
-    
+    target_column_metadata = {}  # Map column_info to full metadata
+
     for table in target_schema:
         table_context = f"Table {table['table_name']} with columns: {', '.join([c['name'] for c in table['columns']])}."
         for column in table["columns"]:
             doc = f"{table_context} Column: {column['name']}. Description: {column.get('description', '')}"
             target_column_docs.append(doc)
-            target_column_info.append(f"{table['table_name']}.{column['name']}")
-    
+            column_key = f"{table['table_name']}.{column['name']}"
+            target_column_info.append(column_key)
+            # Store full metadata including description
+            target_column_metadata[column_key] = {
+                "table": table['table_name'],
+                "column": column['name'],
+                "description": column.get('description', ''),
+                "type": column.get('type', '')
+            }
+
     logger.info(f"Target columns prepared", data={"count": len(target_column_docs)})
 
     if not source_column_docs or not target_column_docs:
@@ -186,9 +213,16 @@ def run_mapper(run_id: str, profile_results: dict, target_schema_dir: str = None
                 best_match_index = j
         
         if best_match_score > similarity_threshold:
+            source_col_key = source_column_info[i]
+            target_col_key = target_column_info[best_match_index]
+
             mapping_candidates.append({
-                "source_column": source_column_info[i],
-                "target_column": target_column_info[best_match_index],
+                "source_table": source_column_metadata[source_col_key]["table"],
+                "source_column": source_col_key,
+                "source_description": source_column_metadata[source_col_key]["description"],
+                "target_table": target_column_metadata[target_col_key]["table"],
+                "target_column": target_col_key,
+                "target_description": target_column_metadata[target_col_key]["description"],
                 "confidence": float(best_match_score),
                 "rationale": f"Best semantic match with score: {best_match_score:.2f}"
             })

@@ -25,6 +25,19 @@ import { ApprovalList } from '../HITL/ApprovalList';
 import { QueryInput } from '../QueryInterface/QueryInput';
 import { PipelineStarter } from '../Workflow/PipelineStarter';
 import { ETLProgressCard } from '../Workflow/ETLProgressCard';
+import { HITLApprovalCard } from '../Workflow/HITLApprovalCard';
+
+// Interface for HITL mapping
+interface HITLMapping {
+  mapping_id: string;
+  source_table: string;
+  source_column: string;
+  target_table: string;
+  target_column: string;
+  confidence: number;
+  rationale: string;
+  status: 'pending' | 'approved' | 'rejected';
+}
 
 export const ChatWindow: React.FC = () => {
   const { 
@@ -41,6 +54,13 @@ export const ChatWindow: React.FC = () => {
   const [input, setInput] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [pipelineDialogOpen, setPipelineDialogOpen] = useState(false);
+  const [hitlMappings, setHitlMappings] = useState<HITLMapping[]>([]);
+  const [showHitlApproval, setShowHitlApproval] = useState(false);
+  const [hitlReady, setHitlReady] = useState(false); // Only show after mappings are fully loaded
+  const [workflowCompleted, setWorkflowCompleted] = useState(false); // Track if workflow_complete was received
+  const [workflowMappings, setWorkflowMappings] = useState<any[]>([]); // Store all mappings for dropdown
+  const [workflowTransformations, setWorkflowTransformations] = useState<any[]>([]); // Store all transformations for dropdown
+  const workflowCompletedRef = useRef(false); // Synchronous ref to prevent race conditions
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -48,8 +68,114 @@ export const ChatWindow: React.FC = () => {
   useWebSocket(currentRun?.run_id || null, (update: WorkflowUpdate) => {
     // Update progress
     if (currentRun) {
+      // PRIORITY 1: Handle workflow_complete FIRST - before any other logic
+      if (update.type === 'workflow_complete') {
+        console.log('🎉 Workflow complete event received:', update);
+        
+        // Set flag immediately (both state and ref) to prevent any subsequent updates from resetting status
+        workflowCompletedRef.current = true; // Synchronous - prevents race conditions
+        setWorkflowCompleted(true);
+        
+        // Update all steps to completed
+        etlSteps.forEach(step => {
+          if (step.status === 'pending' || step.status === 'running') {
+            updateETLStep(step.name, 'completed');
+          }
+        });
+        
+        // Set final status - this is the definitive completion
+        updateCurrentRun({ 
+          status: 'completed',
+          current_step: 'completed',
+          progress: 100
+        });
+        
+        // Clean up HITL state
+        setShowHitlApproval(false);
+        setHitlMappings([]);
+        setHitlReady(false);
+        
+        return; // Exit early - don't process any further logic
+      }
+
+      // PRIORITY 2: If workflow is already completed, ignore all subsequent updates
+      // (cleanup step runs after workflow_complete and would reset status to 'running')
+      // Use ref for synchronous check to avoid race conditions
+      if (workflowCompletedRef.current || workflowCompleted) {
+        // Just update the step status for UI, don't change workflow status
+        const stepStatus = 
+          update.status === 'completed' ? 'completed' :
+          update.status === 'failed' || update.status === 'error' ? 'error' :
+          'running';
+        updateETLStep(update.step, stepStatus, update.message);
+        return; // Exit early - don't process status updates
+      }
+
+      // PRIORITY 3: Handle HITL approval required
+      if (update.type === 'hitl_approval_required') {
+        console.log('HITL approval required:', update);
+        const mappings = (update as any).data?.mappings || [];
+        
+        // Update step status - no separate chat message needed, the card shows all info
+        updateETLStep('hitl', 'running', `${mappings.length} mapping(s) awaiting approval`);
+        
+        // Set mappings and show card after a small delay to let UI settle
+        setHitlMappings(mappings);
+        setShowHitlApproval(true);
+        
+        setTimeout(() => {
+          setHitlReady(true);
+        }, 300);
+        
+        return;
+      }
+      
+      // Store mappings data when mapper step completes
+      if (update.step === 'mapper' && update.status === 'completed' && (update as any).data?.mappings) {
+        setWorkflowMappings((update as any).data.mappings);
+      }
+      
+      // Store transformations data when transform step completes
+      if (update.step === 'transform' && update.status === 'completed' && (update as any).data?.transformations) {
+        setWorkflowTransformations((update as any).data.transformations);
+      }
+      
+      // Also check workflow_complete data for mappings and transformations
+      if (update.type === 'workflow_complete' && (update as any).data) {
+        const data = (update as any).data;
+        if (data.mappings) setWorkflowMappings(data.mappings);
+        if (data.transformations) setWorkflowTransformations(data.transformations);
+      }
+
+      // Handle HITL approval complete
+      if (update.type === 'hitl_approval_complete' || update.type === 'hitl_complete') {
+        setShowHitlApproval(false);
+        setHitlMappings([]);
+        setHitlReady(false);
+      }
+
+      // Handle HITL progress updates
+      if (update.type === 'hitl_progress') {
+        const data = (update as any).data || {};
+        updateETLStep('hitl', 'running', `${data.reviewed || 0} reviewed, ${data.pending || 0} remaining`);
+        return;
+      }
+
+      // PRIORITY 4: Determine the overall workflow status for regular updates
+      // Only mark as 'completed' when the ENTIRE workflow is done (workflow_complete event)
+      // Individual step completions should keep status as 'running'
+      let workflowStatus = update.status;
+      if (update.status === 'completed' && update.type === 'workflow_update') {
+        // Individual step completed - keep workflow running
+        workflowStatus = 'running';
+      } else if (update.status === 'failed' || update.status === 'error') {
+        workflowStatus = 'failed';
+      } else {
+        workflowStatus = 'running';
+      }
+
       updateCurrentRun({
-        status: update.status as any,
+        status: workflowStatus as any,
         current_step: update.step,
         progress: update.progress,
         error: update.error,
@@ -59,21 +185,21 @@ export const ChatWindow: React.FC = () => {
       const stepStatus = 
         update.status === 'completed' ? 'completed' :
         update.status === 'failed' || update.status === 'error' ? 'error' :
-        update.status === 'started' || update.status === 'running' || update.status === 'waiting' ? 'running' :
+        update.status === 'started' || update.status === 'running' || update.status === 'waiting' || update.status === 'waiting_for_approval' ? 'running' :
         'pending';
       
       updateETLStep(update.step, stepStatus, update.message);
-
-      // If workflow is complete, mark all pending steps as completed
-      if (update.type === 'workflow_complete') {
-        etlSteps.forEach(step => {
-          if (step.status === 'pending' || step.status === 'running') {
-            updateETLStep(step.name, 'completed');
-          }
-        });
-      }
     }
   });
+
+  // Handle HITL approval completion
+  const handleHitlApprovalComplete = () => {
+    setShowHitlApproval(false);
+    setHitlMappings([]);
+    setHitlReady(false);
+    updateETLStep('hitl', 'completed', 'Approvals submitted - pipeline continuing');
+    // No chat message needed - the step status shows the info
+  };
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -149,15 +275,22 @@ export const ChatWindow: React.FC = () => {
   };
 
   const handleGCSWorkflowStarted = (runId: string, folderPath: string, files: string[]) => {
-    // Reset ETL steps
+    // Reset ETL steps and HITL state
     resetETLSteps();
+    setHitlMappings([]);
+    setShowHitlApproval(false);
+    setHitlReady(false);
+    setWorkflowCompleted(false); // Reset completion flag for new workflow
+    setWorkflowMappings([]); // Reset mappings
+    setWorkflowTransformations([]); // Reset transformations
+    workflowCompletedRef.current = false; // Reset ref for new workflow
 
-    // Set the current run
+    // Set the current run with progress starting at 0
     setCurrentRun({
       run_id: runId,
       folder_path: folderPath,
       gcs_uri: `gs://${folderPath}`,
-      status: 'pending',
+      status: 'running',  // Start as running, not pending
       current_step: 'initialized',
       progress: 0,
       source_type: 'gcs_folder',
@@ -251,8 +384,22 @@ export const ChatWindow: React.FC = () => {
     currentRun.status !== 'pending' && 
     currentRun.source_type === 'gcs_folder';
 
+  // Only mark workflow as complete when status is 'completed' or 'success'
   const isWorkflowComplete = currentRun && 
     (currentRun.status === 'completed' || currentRun.status === 'success');
+  
+  // Debug logging
+  React.useEffect(() => {
+    if (currentRun) {
+      console.log('Current run state:', {
+        status: currentRun.status,
+        current_step: currentRun.current_step,
+        progress: currentRun.progress,
+        isWorkflowActive,
+        isWorkflowComplete
+      });
+    }
+  }, [currentRun?.status, currentRun?.current_step, currentRun?.progress]);
 
   return (
     <Box sx={{ height: '100vh', display: 'flex', flexDirection: 'column' }}>
@@ -298,6 +445,18 @@ export const ChatWindow: React.FC = () => {
             status={currentRun.status}
             steps={etlSteps}
             error={currentRun.error}
+            isHitlWaiting={showHitlApproval && hitlReady}
+            mappings={workflowMappings}
+            transformations={workflowTransformations}
+          />
+        )}
+
+        {/* HITL Approval Card - Shows when human approval is required and mappings are ready */}
+        {showHitlApproval && hitlReady && hitlMappings.length > 0 && currentRun && (
+          <HITLApprovalCard
+            runId={currentRun.run_id}
+            mappings={hitlMappings}
+            onApprovalComplete={handleHitlApprovalComplete}
           />
         )}
 

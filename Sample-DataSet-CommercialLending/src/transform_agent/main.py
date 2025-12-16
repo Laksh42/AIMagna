@@ -15,16 +15,20 @@ logger = AgentLogger("TransformAgent")
 
 def load_source_schema_with_fks(source_schema_dir: str = None):
     """Loads the source schema and builds a graph of foreign key relationships.
-    
+
     Args:
         source_schema_dir: Optional path to source schema directory.
                           Defaults to "Source-Schema-DataSets" if not provided.
     """
     base_dir = source_schema_dir if source_schema_dir else "Source-Schema-DataSets"
     schema_path = os.path.join(base_dir, "schema.json")
-    
+
+    # Try alternative naming convention if schema.json doesn't exist
+    if not os.path.exists(schema_path):
+        schema_path = os.path.join(base_dir, "source_schema.json")
+
     logger.info(f"Loading source schema with FK relationships", data={"path": schema_path})
-    
+
     with open(schema_path, 'r') as f:
         source_schema = json.load(f)
     
@@ -79,10 +83,10 @@ def find_join_path_bfs(start_table, end_table, adj_list):
     return None  # No path found
 
 
-def run_transform(run_id: str, approved_mappings: list, source_tables_info: list, source_dataset: str, source_schema_dir: str = None):
+def run_transform(run_id: str, approved_mappings: list, source_tables_info: list, source_dataset: str, source_schema_dir: str = None, target_dataset: str = None):
     """
     Generates the SQL transformations to load the target tables, with robust JOIN logic.
-    
+
     Args:
         run_id: The unique identifier for this workflow run.
         approved_mappings: The list of approved mappings from HITL.
@@ -90,13 +94,14 @@ def run_transform(run_id: str, approved_mappings: list, source_tables_info: list
         source_dataset: The BigQuery dataset containing source data.
         source_schema_dir: Optional path to source schema directory.
                           Defaults to "Source-Schema-DataSets" if not provided.
-    
+        target_dataset: The BigQuery dataset for target tables (optional, reads from env if not provided).
+
     Returns:
         A list of SQL transformation statements.
     """
     logger.set_run_id(run_id)
     start_time = time.time()
-    
+
     logger.header("TRANSFORM AGENT")
     logger.info("Starting SQL transformation generation", data={
         "approved_mappings": len(approved_mappings),
@@ -105,7 +110,8 @@ def run_transform(run_id: str, approved_mappings: list, source_tables_info: list
     })
 
     gcp_project_id = os.getenv("GCP_PROJECT_ID")
-    bigquery_dataset = os.getenv("BIGQUERY_DATASET")
+    # Use provided target_dataset or fall back to environment variable
+    bigquery_dataset = target_dataset if target_dataset else os.getenv("BIGQUERY_DATASET")
 
     if not gcp_project_id or not bigquery_dataset or not source_dataset:
         logger.error("Missing required configuration", data={
@@ -117,7 +123,7 @@ def run_transform(run_id: str, approved_mappings: list, source_tables_info: list
 
     logger.info("Configuration loaded", data={
         "project": gcp_project_id,
-        "dataset": bigquery_dataset,
+        "target_dataset": bigquery_dataset,
         "source_dataset": source_dataset
     })
 

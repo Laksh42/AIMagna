@@ -9,9 +9,21 @@ const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
 export const useWebSocket = (runId: string | null, onMessage: (update: WorkflowUpdate) => void) => {
   const [isConnected, setIsConnected] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
+  const onMessageRef = useRef(onMessage);
+
+  // Update the ref when onMessage changes (without triggering reconnection)
+  useEffect(() => {
+    onMessageRef.current = onMessage;
+  }, [onMessage]);
 
   useEffect(() => {
     if (!runId) return;
+
+    // Close existing socket if any
+    if (socketRef.current?.readyState === WebSocket.OPEN) {
+      console.log('Closing existing WebSocket connection');
+      socketRef.current.close();
+    }
 
     // Create WebSocket connection
     const wsUrl = `${WS_URL}/ws/${runId}`;
@@ -28,7 +40,8 @@ export const useWebSocket = (runId: string | null, onMessage: (update: WorkflowU
       try {
         const update: WorkflowUpdate = JSON.parse(event.data);
         console.log('WebSocket message received:', update);
-        onMessage(update);
+        // Use the ref to always get the latest onMessage callback
+        onMessageRef.current(update);
       } catch (error) {
         console.error('Error parsing WebSocket message:', error);
       }
@@ -53,11 +66,12 @@ export const useWebSocket = (runId: string | null, onMessage: (update: WorkflowU
     // Cleanup
     return () => {
       clearInterval(heartbeat);
-      if (socket.readyState === WebSocket.OPEN) {
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
         socket.close();
       }
+      socketRef.current = null;
     };
-  }, [runId, onMessage]);
+  }, [runId]); // Removed onMessage from dependencies to prevent reconnection loops
 
   return { isConnected };
 };

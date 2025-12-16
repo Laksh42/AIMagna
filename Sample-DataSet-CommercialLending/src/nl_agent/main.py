@@ -750,13 +750,68 @@ async def list_folder_files(folder_path: str):
 
 
 # ============================================================================
+# HELPER FUNCTIONS FOR FOLDER DETECTION
+# ============================================================================
+def detect_source_and_target_folders(base_folder_path: str):
+    """
+    Detect the actual source and target folder names used in the GCS bucket.
+    Supports multiple naming conventions:
+    - CommercialLending: Source-Schema-DataSets, Target-Schema
+    - WorldBankData: SourceSchemaData, TargetSchema
+
+    Args:
+        base_folder_path: The base folder path in GCS
+
+    Returns:
+        Tuple of (source_folder_path, source_folder_name, target_folder_path, target_folder_name)
+        or (None, None, None, None) if folders not found
+    """
+    # Possible naming conventions
+    source_folder_names = ["Source-Schema-DataSets", "SourceSchemaData"]
+    target_folder_names = ["Target-Schema", "TargetSchema"]
+
+    source_folder = None
+    source_name = None
+    target_folder = None
+    target_name = None
+
+    # Try to find source folder
+    for name in source_folder_names:
+        folder_path = f"{base_folder_path}/{name}"
+        try:
+            files = gcs_io.list_files_in_folder(folder_path)
+            if files:
+                source_folder = folder_path
+                source_name = name
+                logger.info(f"Detected source folder: {name}")
+                break
+        except:
+            continue
+
+    # Try to find target folder
+    for name in target_folder_names:
+        folder_path = f"{base_folder_path}/{name}"
+        try:
+            files = gcs_io.list_files_in_folder(folder_path)
+            if files:
+                target_folder = folder_path
+                target_name = name
+                logger.info(f"Detected target folder: {name}")
+                break
+        except:
+            continue
+
+    return source_folder, source_name, target_folder, target_name
+
+
+# ============================================================================
 # ENDPOINT 12b: Get Folder Structure (subfolders and files)
 # ============================================================================
 @app.get("/gcs/folders/{folder_path:path}/structure")
 async def get_folder_structure(folder_path: str):
     """
     Get the complete structure of a folder including subfolders and their files.
-    Specifically looks for Source-Schema-DataSets and Target-Schema subfolders.
+    Detects folder naming conventions automatically (supports both CommercialLending and WorldBankData formats).
 
     Args:
         folder_path: The folder path in the bucket
@@ -767,7 +822,7 @@ async def get_folder_structure(folder_path: str):
     try:
         folder_path = folder_path.rstrip('/')
         logger.info(f"Getting folder structure for: {folder_path}")
-        
+
         structure = {
             "bucket": GCS_BUCKET,
             "folder": folder_path,
@@ -777,17 +832,18 @@ async def get_folder_structure(folder_path: str):
             "target_folder": None,
             "ready_for_etl": False
         }
-        
-        # Check for Source-Schema-DataSets subfolder
-        source_folder = f"{folder_path}/Source-Schema-DataSets"
-        source_files = gcs_io.list_files_in_folder(source_folder)
-        
-        if source_files:
+
+        # Detect actual folder names
+        source_folder, source_name, target_folder, target_name = detect_source_and_target_folders(folder_path)
+
+        # Process source folder if found
+        if source_folder:
+            source_files = gcs_io.list_files_in_folder(source_folder)
             csv_files = [f for f in source_files if f['name'].endswith('.csv')]
             schema_files = [f for f in source_files if f['name'] == 'schema.json']
-            
+
             structure["source_folder"] = {
-                "name": "Source-Schema-DataSets",
+                "name": source_name,
                 "path": source_folder,
                 "gcs_uri": f"gs://{GCS_BUCKET}/{source_folder}",
                 "files": source_files,
@@ -796,16 +852,14 @@ async def get_folder_structure(folder_path: str):
                 "total_files": len(source_files)
             }
             structure["subfolders"].append(structure["source_folder"])
-        
-        # Check for Target-Schema subfolder
-        target_folder = f"{folder_path}/Target-Schema"
-        target_files = gcs_io.list_files_in_folder(target_folder)
-        
-        if target_files:
+
+        # Process target folder if found
+        if target_folder:
+            target_files = gcs_io.list_files_in_folder(target_folder)
             sql_files = [f for f in target_files if f['name'].endswith('.sql')]
-            
+
             structure["target_folder"] = {
-                "name": "Target-Schema",
+                "name": target_name,
                 "path": target_folder,
                 "gcs_uri": f"gs://{GCS_BUCKET}/{target_folder}",
                 "files": target_files,
@@ -813,21 +867,21 @@ async def get_folder_structure(folder_path: str):
                 "total_files": len(target_files)
             }
             structure["subfolders"].append(structure["target_folder"])
-        
+
         # Check if ready for ETL
         structure["ready_for_etl"] = (
-            structure["source_folder"] is not None and 
+            structure["source_folder"] is not None and
             structure["source_folder"]["csv_count"] > 0
         )
-        
+
         logger.success(f"Folder structure retrieved", data={
             "source_files": structure["source_folder"]["total_files"] if structure["source_folder"] else 0,
             "target_files": structure["target_folder"]["total_files"] if structure["target_folder"] else 0,
             "ready_for_etl": structure["ready_for_etl"]
         })
-        
+
         return structure
-        
+
     except Exception as e:
         logger.error(f"Error getting folder structure: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get folder structure: {str(e)}")
@@ -844,10 +898,7 @@ class GCSWorkflowRequest(BaseModel):
 async def start_workflow_from_gcs(request: GCSWorkflowRequest):
     """
     Start the ETL workflow using files from a GCS folder.
-    Expects folder structure:
-        folder_path/
-        ├── Source-Schema-DataSets/   <- CSV files + schema.json
-        └── Target-Schema/            <- SQL schema files
+    Auto-detects folder naming conventions (CommercialLending or WorldBankData formats).
 
     Args:
         request: Contains folder_path in the GCS bucket
@@ -857,50 +908,51 @@ async def start_workflow_from_gcs(request: GCSWorkflowRequest):
     """
     try:
         folder_path = request.folder_path.rstrip('/')
-        
+
         # Generate unique run_id
         run_id = f"run_{uuid.uuid4().hex[:8]}_{int(datetime.utcnow().timestamp())}"
-        
+
         logger.info(f"Starting workflow from GCS folder", data={
             "run_id": run_id,
             "folder_path": folder_path
         })
-        
-        # Check for Source-Schema-DataSets subfolder
-        source_folder = f"{folder_path}/Source-Schema-DataSets"
-        source_files = gcs_io.list_files_in_folder(source_folder)
-        
-        if not source_files:
+
+        # Detect actual folder names
+        source_folder, source_name, target_folder, target_name = detect_source_and_target_folders(folder_path)
+
+        # Check source folder
+        if not source_folder:
             # Try without subfolder (backward compatibility)
             source_files = gcs_io.list_files_in_folder(folder_path)
             if not source_files:
-                raise HTTPException(status_code=400, detail=f"No files found in folder: {folder_path}")
+                raise HTTPException(status_code=400, detail=f"No source folder found in: {folder_path}")
             source_folder = folder_path
-            logger.info("Using root folder for source files (no Source-Schema-DataSets subfolder)")
+            source_name = "root"
+            logger.info("Using root folder for source files (no source subfolder)")
         else:
-            logger.info(f"Found Source-Schema-DataSets subfolder with {len(source_files)} files")
-        
+            logger.info(f"Found {source_name} subfolder")
+
+        source_files = gcs_io.list_files_in_folder(source_folder)
+
         # Filter for CSV files
         csv_files = [f for f in source_files if f['name'].endswith('.csv')]
         schema_files = [f for f in source_files if f['name'] == 'schema.json']
-        
+
         if not csv_files:
             raise HTTPException(status_code=400, detail=f"No CSV files found in source folder")
-        
+
         if not schema_files:
             logger.warning("No schema.json found - will attempt to auto-detect schema")
-        
-        # Check for Target-Schema subfolder
-        target_folder = f"{folder_path}/Target-Schema"
-        target_files = gcs_io.list_files_in_folder(target_folder)
-        sql_files = [f for f in target_files if f['name'].endswith('.sql')]
-        
-        if not sql_files:
-            # Fall back to local Target-Schema
-            logger.warning("No Target-Schema subfolder in GCS - will use local Target-Schema")
-            target_folder = None
+
+        # Check target folder
+        if target_folder:
+            target_files = gcs_io.list_files_in_folder(target_folder)
+            sql_files = [f for f in target_files if f['name'].endswith('.sql')]
+            logger.info(f"Found {target_name} subfolder with {len(sql_files)} SQL files")
         else:
-            logger.info(f"Found Target-Schema subfolder with {len(sql_files)} SQL files")
+            # Fall back to local Target-Schema
+            logger.warning("No target schema subfolder in GCS - will use local Target-Schema")
+            sql_files = []
         
         # Create run record in Firestore
         run_metadata = {

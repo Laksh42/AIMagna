@@ -16,12 +16,12 @@ logger = AgentLogger("ProfilerAgent")
 def run_profiler(run_id: str, source_dir: str = None):
     """
     Analyzes the source data and generates profiling statistics.
-    
+
     Args:
         run_id: The unique identifier for this workflow run.
-        source_dir: Optional path to source directory containing schema.json and CSV files.
+        source_dir: Optional path to source directory containing schema.json (or source_schema.json) and CSV files.
                    Defaults to "Source-Schema-DataSets" if not provided.
-    
+
     Returns:
         A dictionary containing the profiling results.
     """
@@ -35,9 +35,14 @@ def run_profiler(run_id: str, source_dir: str = None):
     logger.info("Starting source data profiling", data={"source_dir": base_dir})
 
     # 1. Read schema.json to get the list of tables
+    # Try multiple naming conventions
     schema_path = os.path.join(base_dir, "schema.json")
+    if not os.path.exists(schema_path):
+        # Try alternative naming convention (WorldBankData uses source_schema.json)
+        schema_path = os.path.join(base_dir, "source_schema.json")
+
     logger.info(f"Loading schema from: {schema_path}")
-    
+
     try:
         with open(schema_path, 'r') as f:
             source_schema = json.load(f)

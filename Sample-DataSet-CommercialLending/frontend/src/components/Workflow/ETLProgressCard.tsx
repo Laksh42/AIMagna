@@ -1,6 +1,6 @@
 // ETL Progress Card - Shows unified progress for all ETL steps
 
-import React from 'react';
+import React, { useRef, useEffect } from 'react';
 import {
   Card,
   CardContent,
@@ -10,7 +10,6 @@ import {
   Stepper,
   Step,
   StepLabel,
-  StepContent,
   Chip,
   Collapse,
   IconButton,
@@ -22,7 +21,13 @@ import {
   Error as ErrorIcon,
   ExpandMore as ExpandIcon,
   ExpandLess as CollapseIcon,
+  Info as InfoIcon,
 } from '@mui/icons-material';
+import {
+  Accordion,
+  AccordionSummary,
+  AccordionDetails,
+} from '@mui/material';
 
 interface ETLStep {
   name: string;
@@ -40,6 +45,9 @@ interface ETLProgressCardProps {
   status: string;
   steps: ETLStep[];
   error?: string;
+  isHitlWaiting?: boolean; // Indicates if HITL approval is waiting
+  mappings?: any[]; // Mappings data for dropdown
+  transformations?: any[]; // Transformations data for dropdown
 }
 
 const ETL_STEPS = [
@@ -64,8 +72,29 @@ export const ETLProgressCard: React.FC<ETLProgressCardProps> = ({
   status,
   steps,
   error,
+  isHitlWaiting = false,
+  mappings = [],
+  transformations = [],
 }) => {
-  const [expanded, setExpanded] = React.useState(true);
+  // Keep steps collapsed by default for cleaner UI
+  const [expanded, setExpanded] = React.useState(false);
+
+  // Track the maximum progress to prevent backwards movement
+  const maxProgressRef = useRef(0);
+  
+  // Calculate smooth progress - only increase, never decrease
+  const smoothProgress = React.useMemo(() => {
+    const newProgress = Math.max(0, Math.min(100, overallProgress || 0));
+    if (newProgress > maxProgressRef.current) {
+      maxProgressRef.current = newProgress;
+    }
+    return maxProgressRef.current;
+  }, [overallProgress]);
+  
+  // Reset max progress when run changes
+  useEffect(() => {
+    maxProgressRef.current = 0;
+  }, [runId]);
 
   const getStepStatus = (stepName: string): 'pending' | 'running' | 'completed' | 'error' => {
     const step = steps.find(s => s.name === stepName);
@@ -100,14 +129,20 @@ export const ETLProgressCard: React.FC<ETLProgressCardProps> = ({
 
   const isComplete = status === 'completed' || status === 'success';
   const isFailed = status === 'failed' || status === 'error';
+  
+  // Get current stage name
+  const getCurrentStageName = (): string => {
+    const step = ETL_STEPS.find(s => s.name === currentStep);
+    return step ? step.label : currentStep;
+  };
 
   return (
     <Card 
       sx={{ 
         mb: 2, 
         border: 2, 
-        borderColor: isComplete ? 'success.main' : isFailed ? 'error.main' : 'primary.main',
-        bgcolor: isComplete ? 'success.50' : isFailed ? 'error.50' : 'background.paper',
+        borderColor: isComplete ? 'success.main' : isFailed ? 'error.main' : isHitlWaiting ? 'warning.main' : 'primary.main',
+        bgcolor: isComplete ? 'success.50' : isFailed ? 'error.50' : isHitlWaiting ? 'warning.50' : 'background.paper',
       }}
     >
       <CardContent>
@@ -118,9 +153,20 @@ export const ETLProgressCard: React.FC<ETLProgressCardProps> = ({
               🚀 ETL Pipeline
             </Typography>
             <Chip 
-              label={isComplete ? 'Completed' : isFailed ? 'Failed' : 'Running'} 
+              label={
+                isComplete ? 'Completed' : 
+                isFailed ? 'Failed' : 
+                isHitlWaiting ? 'Waiting' : 
+                'Running'
+              } 
               size="small"
-              color={isComplete ? 'success' : isFailed ? 'error' : 'primary'}
+              color={
+                isComplete ? 'success' : 
+                isFailed ? 'error' : 
+                isHitlWaiting ? 'warning' : 
+                'primary'
+              }
+              sx={isHitlWaiting ? { bgcolor: '#f57c00', color: 'white' } : {}}
             />
           </Box>
           <IconButton size="small" onClick={() => setExpanded(!expanded)}>
@@ -138,21 +184,22 @@ export const ETLProgressCard: React.FC<ETLProgressCardProps> = ({
         <Box mb={2}>
           <Box display="flex" justifyContent="space-between" mb={0.5}>
             <Typography variant="body2" fontWeight="medium">
-              Overall Progress
+              <strong>{getCurrentStageName()}</strong> - Overall Progress
             </Typography>
             <Typography variant="body2" color="primary">
-              {overallProgress}%
+              {smoothProgress}%
             </Typography>
           </Box>
           <LinearProgress 
             variant="determinate" 
-            value={overallProgress} 
+            value={smoothProgress} 
             sx={{ 
               height: 10, 
               borderRadius: 5,
               bgcolor: 'grey.200',
               '& .MuiLinearProgress-bar': {
                 bgcolor: isComplete ? 'success.main' : isFailed ? 'error.main' : 'primary.main',
+                transition: 'transform 0.5s ease-in-out',
               }
             }}
           />
@@ -173,7 +220,9 @@ export const ETLProgressCard: React.FC<ETLProgressCardProps> = ({
             {ETL_STEPS.map((step) => {
               const stepStatus = getStepStatus(step.name);
               const message = getStepMessage(step.name);
-              
+              const isMapperStep = step.name === 'mapper' && isComplete && mappings.length > 0;
+              const isTransformStep = step.name === 'transform' && isComplete && transformations.length > 0;
+
               return (
                 <Step key={step.name} completed={stepStatus === 'completed'}>
                   <StepLabel
@@ -186,17 +235,76 @@ export const ETLProgressCard: React.FC<ETLProgressCardProps> = ({
                       ) : null
                     }
                   >
-                    <Typography 
-                      variant="body2"
-                      color={
-                        stepStatus === 'running' ? 'primary.main' : 
-                        stepStatus === 'completed' ? 'success.main' :
-                        stepStatus === 'error' ? 'error.main' : 'text.secondary'
-                      }
-                      fontWeight={stepStatus === 'running' ? 'bold' : 'normal'}
-                    >
-                      {step.label}
-                    </Typography>
+                    <Box display="flex" alignItems="center" gap={1} flexWrap="wrap">
+                      <Typography
+                        variant="body2"
+                        color={
+                          stepStatus === 'running' ? 'primary.main' :
+                          stepStatus === 'completed' ? 'success.main' :
+                          stepStatus === 'error' ? 'error.main' : 'text.secondary'
+                        }
+                        fontWeight={stepStatus === 'running' ? 'bold' : 'normal'}
+                      >
+                        {step.label}
+                      </Typography>
+                      
+                      {/* Dropdown for Mappings */}
+                      {isMapperStep && (
+                        <Accordion sx={{ width: '100%', boxShadow: 'none', mt: 1 }}>
+                          <AccordionSummary expandIcon={<ExpandIcon />} sx={{ minHeight: 32, py: 0 }}>
+                            <Typography variant="caption" color="primary" sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                              <InfoIcon fontSize="small" />
+                              View {mappings.length} Mapping(s)
+                            </Typography>
+                          </AccordionSummary>
+                          <AccordionDetails sx={{ pt: 1, pb: 1 }}>
+                            <Box sx={{ maxHeight: 300, overflow: 'auto' }}>
+                              {mappings.map((mapping: any, idx: number) => (
+                                <Box key={idx} sx={{ mb: 1, p: 1, bgcolor: 'grey.50', borderRadius: 1 }}>
+                                  <Typography variant="caption" fontFamily="monospace" display="block">
+                                    <strong>Source:</strong> {mapping.source_table}.{mapping.source_column?.split('.').pop()}
+                                  </Typography>
+                                  <Typography variant="caption" fontFamily="monospace" display="block">
+                                    <strong>Target:</strong> {mapping.target_table}.{mapping.target_column?.split('.').pop()}
+                                  </Typography>
+                                  {mapping.confidence && (
+                                    <Chip 
+                                      label={`${(mapping.confidence * 100).toFixed(1)}%`} 
+                                      size="small" 
+                                      sx={{ mt: 0.5 }}
+                                      color={mapping.confidence >= 0.95 ? 'success' : mapping.confidence >= 0.9 ? 'warning' : 'error'}
+                                    />
+                                  )}
+                                </Box>
+                              ))}
+                            </Box>
+                          </AccordionDetails>
+                        </Accordion>
+                      )}
+                      
+                      {/* Dropdown for Transformations */}
+                      {isTransformStep && (
+                        <Accordion sx={{ width: '100%', boxShadow: 'none', mt: 1 }}>
+                          <AccordionSummary expandIcon={<ExpandIcon />} sx={{ minHeight: 32, py: 0 }}>
+                            <Typography variant="caption" color="primary" sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                              <InfoIcon fontSize="small" />
+                              View {transformations.length} Transformation(s)
+                            </Typography>
+                          </AccordionSummary>
+                          <AccordionDetails sx={{ pt: 1, pb: 1 }}>
+                            <Box sx={{ maxHeight: 300, overflow: 'auto' }}>
+                              {transformations.map((transform: any, idx: number) => (
+                                <Box key={idx} sx={{ mb: 1, p: 1, bgcolor: 'grey.50', borderRadius: 1 }}>
+                                  <Typography variant="caption" fontFamily="monospace" display="block" sx={{ whiteSpace: 'pre-wrap' }}>
+                                    {transform.sql || transform.query || JSON.stringify(transform, null, 2)}
+                                  </Typography>
+                                </Box>
+                              ))}
+                            </Box>
+                          </AccordionDetails>
+                        </Accordion>
+                      )}
+                    </Box>
                   </StepLabel>
                 </Step>
               );
